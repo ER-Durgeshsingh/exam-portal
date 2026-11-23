@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Online Exam Portal (React + Node + MySQL)
 
 ## Setup
@@ -11,3 +12,6 @@
 - Admin: exam + MCQ create karna, sabhi results dekhna
 - Server-side timer + auto-submit, auto-evaluation (correct answers client ko nahi jaate)
 - Anti-cheat: tab switch, fullscreen exit detect; copy/paste/right-click block; 3 violations par auto-submit
+=======
+# exam-portal
+>>>>>>> 7a82b23a4d72ce9c386dc8e1375cbacfadd76854
