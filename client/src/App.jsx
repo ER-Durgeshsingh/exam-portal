@@ -1,122 +1,103 @@
-import React,{useState,useEffect,useRef,useCallback} from 'react';
-const API=(import.meta.env.VITE_API_URL||'http://localhost:5000')+'/api';
-const MAX_VIOLATIONS=3;
+require('dotenv').config();
+const express=require('express'),cors=require('cors'),mysql=require('mysql2/promise');
+const jwt=require('jsonwebtoken'),bcrypt=require('bcryptjs');
+const app=express(); app.use(cors({origin:process.env.CLIENT_URL||'*'})); app.use(express.json());
+const db=mysql.createPool({host:process.env.DB_HOST,port:process.env.DB_PORT||3306,
+  user:process.env.DB_USER,password:process.env.DB_PASS,database:process.env.DB_NAME,
+  waitForConnections:true,
+  ssl:process.env.DB_SSL==='true'?{minVersion:'TLSv1.2',rejectUnauthorized:true}:undefined});
+const SECRET=process.env.JWT_SECRET||'secret';
+const wrap=fn=>(req,res)=>fn(req,res).catch(e=>{console.error(e);res.status(500).json({error:'Server error'})});
 
-async function api(path,method='GET',body){
-  const token=localStorage.getItem('token');
-  const r=await fetch(API+path,{method,headers:{'Content-Type':'application/json',...(token&&{Authorization:'Bearer '+token})},
-    body:body?JSON.stringify(body):undefined});
-  const d=await r.json(); if(!r.ok)throw new Error(d.error||'Error'); return d;
-}
+const auth=(req,res,next)=>{
+  try{req.user=jwt.verify((req.headers.authorization||'').replace('Bearer ',''),SECRET);next();}
+  catch{res.status(401).json({error:'Login required'});}
+};
+const adminOnly=(req,res,next)=>req.user.role==='admin'?next():res.status(403).json({error:'Admin only'});
 
-function Auth({onLogin}){
-  const [mode,setMode]=useState('login'),[f,setF]=useState({name:'',email:'',password:'',role:'student'}),[err,setErr]=useState('');
-  const set=k=>e=>setF({...f,[k]:e.target.value});
-  const submit=async()=>{try{
-    if(mode==='register'){await api('/register','POST',f);setMode('login');setErr('Registered! Now login.');return;}
-    const d=await api('/login','POST',f);localStorage.setItem('token',d.token);localStorage.setItem('user',JSON.stringify(d.user));onLogin(d.user);
-  }catch(e){setErr(e.message);}};
-  return <div className="wrap"><div className="card"><h2>Online Exam Portal</h2>
-    {mode==='register'&&<input placeholder="Name" onChange={set('name')}/>}
-    <input placeholder="Email" onChange={set('email')}/>
-    <input type="password" placeholder="Password" onChange={set('password')}/>
-    <p style={{color:'#dc2626'}}>{err}</p>
-    <button onClick={submit}>{mode==='login'?'Login':'Register'}</button>
-    <button className="sec" onClick={()=>setMode(mode==='login'?'register':'login')}>{mode==='login'?'New user?':'Have account?'}</button>
-  </div></div>;
-}
+app.post('/api/register',wrap(async(req,res)=>{
+  const{name,email,password}=req.body;
+  if(!name||!email||!password)return res.status(400).json({error:'All fields required'});
+  const [ex]=await db.query('SELECT id FROM users WHERE email=?',[email]);
+  if(ex.length)return res.status(400).json({error:'Email already used'});
+  const hash=await bcrypt.hash(password,10);
+  // Everyone registers as student. Make admin manually in DB:
+  // UPDATE users SET role='admin' WHERE email='your@email.com';
+  await db.query('INSERT INTO users(name,email,password,role) VALUES(?,?,?,?)',
+    [name,email,hash,'student']);
+  res.json({ok:true});
+}));
 
-function Exam({examId,onExit}){
-  const [data,setData]=useState(null),[answers,setAnswers]=useState({}),[idx,setIdx]=useState(0);
-  const [time,setTime]=useState(0),[viol,setViol]=useState(0),[result,setResult]=useState(null),[msg,setMsg]=useState('');
-  const submitted=useRef(false),answersRef=useRef({}); answersRef.current=answers;
+app.post('/api/login',wrap(async(req,res)=>{
+  const{email,password}=req.body;
+  const [r]=await db.query('SELECT * FROM users WHERE email=?',[email]);
+  if(!r.length||!(await bcrypt.compare(password,r[0].password)))
+    return res.status(400).json({error:'Wrong email or password'});
+  const u=r[0];
+  const token=jwt.sign({id:u.id,role:u.role,name:u.name},SECRET,{expiresIn:'1d'});
+  res.json({token,user:{id:u.id,name:u.name,role:u.role}});
+}));
 
-  const submit=useCallback(async()=>{
-    if(submitted.current||!data)return; submitted.current=true;
-    if(document.fullscreenElement)document.exitFullscreen().catch(()=>{});
-    try{setResult(await api(`/attempts/${data.attemptId}/submit`,'POST',{answers:answersRef.current}));}
-    catch(e){setMsg(e.message);}
-  },[data]);
+app.get('/api/exams',auth,wrap(async(req,res)=>{
+  const [r]=await db.query(`SELECT e.*,(SELECT COUNT(*) FROM questions q WHERE q.exam_id=e.id) AS qcount,
+    (SELECT COUNT(*) FROM attempts a WHERE a.exam_id=e.id AND a.user_id=? AND a.submitted_at IS NOT NULL) AS done
+    FROM exams e`,[req.user.id]);
+  res.json(r);
+}));
 
-  useEffect(()=>{api(`/exams/${examId}/start`,'POST').then(d=>{setData(d);setTime(d.remaining);
-    document.documentElement.requestFullscreen?.().catch(()=>{});}).catch(e=>setMsg(e.message));},[examId]);
+// Start exam: creates attempt, returns questions WITHOUT correct answers + remaining time
+app.post('/api/exams/:id/start',auth,wrap(async(req,res)=>{
+  const eid=req.params.id;
+  const [ex]=await db.query('SELECT * FROM exams WHERE id=?',[eid]);
+  if(!ex.length)return res.status(404).json({error:'Exam not found'});
+  const [done]=await db.query('SELECT id FROM attempts WHERE user_id=? AND exam_id=? AND submitted_at IS NOT NULL',[req.user.id,eid]);
+  if(done.length)return res.status(400).json({error:'Exam already submitted'});
+  let [att]=await db.query('SELECT * FROM attempts WHERE user_id=? AND exam_id=? AND submitted_at IS NULL',[req.user.id,eid]);
+  let attemptId;
+  if(att.length)attemptId=att[0].id;
+  else{const [i]=await db.query('INSERT INTO attempts(user_id,exam_id) VALUES(?,?)',[req.user.id,eid]);attemptId=i.insertId;}
+  const [[t]]=await db.query('SELECT TIMESTAMPDIFF(SECOND,started_at,NOW()) AS elapsed FROM attempts WHERE id=?',[attemptId]);
+  const remaining=Math.max(0,ex[0].duration_min*60-t.elapsed);
+  const [qs]=await db.query('SELECT id,text,a,b,c,d FROM questions WHERE exam_id=?',[eid]);
+  res.json({attemptId,title:ex[0].title,remaining,questions:qs});
+}));
 
-  // Timer
-  useEffect(()=>{if(!data||result)return;
-    const t=setInterval(()=>setTime(s=>{if(s<=1){clearInterval(t);return 0;}return s-1;}),1000);return()=>clearInterval(t);},[data,result]);
-  useEffect(()=>{if(data&&time===0&&!result)submit();},[time,data,result,submit]);
+app.post('/api/attempts/:id/violation',auth,wrap(async(req,res)=>{
+  await db.query('UPDATE attempts SET violations=violations+1 WHERE id=? AND user_id=? AND submitted_at IS NULL',[req.params.id,req.user.id]);
+  const [[a]]=await db.query('SELECT violations FROM attempts WHERE id=?',[req.params.id]);
+  res.json({violations:a.violations});
+}));
 
-  // Anti-cheat: tab switch, fullscreen exit; block copy/paste/right-click
-  useEffect(()=>{
-    if(!data||result)return;
-    const report=async why=>{
-      if(submitted.current)return;
-      try{const r=await api(`/attempts/${data.attemptId}/violation`,'POST');setViol(r.violations);
-        setMsg(`Warning: ${why}. Violation ${r.violations}/${MAX_VIOLATIONS}`);
-        if(r.violations>=MAX_VIOLATIONS)submit();}catch{}
-    };
-    const onVis=()=>{if(document.hidden)report('Tab switched');};
-    const onFs=()=>{if(!document.fullscreenElement)report('Fullscreen exited');};
-    const block=e=>e.preventDefault();
-    document.addEventListener('visibilitychange',onVis);
-    document.addEventListener('fullscreenchange',onFs);
-    document.addEventListener('copy',block);document.addEventListener('paste',block);
-    document.addEventListener('contextmenu',block);
-    return()=>{document.removeEventListener('visibilitychange',onVis);document.removeEventListener('fullscreenchange',onFs);
-      document.removeEventListener('copy',block);document.removeEventListener('paste',block);document.removeEventListener('contextmenu',block);};
-  },[data,result,submit]);
+// Submit: server-side evaluation (10s grace for network delay)
+app.post('/api/attempts/:id/submit',auth,wrap(async(req,res)=>{
+  const [att]=await db.query('SELECT a.*,e.duration_min FROM attempts a JOIN exams e ON e.id=a.exam_id WHERE a.id=? AND a.user_id=?',[req.params.id,req.user.id]);
+  if(!att.length)return res.status(404).json({error:'Attempt not found'});
+  if(att[0].submitted_at)return res.status(400).json({error:'Already submitted'});
+  const answers=req.body.answers||{};
+  const [qs]=await db.query('SELECT id,correct FROM questions WHERE exam_id=?',[att[0].exam_id]);
+  const [[t]]=await db.query('SELECT TIMESTAMPDIFF(SECOND,started_at,NOW()) AS elapsed FROM attempts WHERE id=?',[att[0].id]);
+  const late=t.elapsed>att[0].duration_min*60+10;
+  let score=0; if(!late)qs.forEach(q=>{if(answers[q.id]===q.correct)score++;});
+  await db.query('UPDATE attempts SET submitted_at=NOW(),score=?,total=? WHERE id=?',[score,qs.length,att[0].id]);
+  res.json({score,total:qs.length,late});
+}));
 
-  if(result)return <div className="wrap"><div className="card"><h2>{result.late?'Time over':'Exam Submitted'}</h2>
-    <h1>{result.score} / {result.total}</h1>{result.late&&<p>Late submission: score 0.</p>}
-    <button onClick={onExit}>Back to Dashboard</button></div></div>;
-  if(!data)return <div className="wrap"><div className="card">{msg||'Loading...'}<br/>{msg&&<button onClick={onExit}>Back</button>}</div></div>;
+app.get('/api/results',auth,wrap(async(req,res)=>{
+  const sql=req.user.role==='admin'
+    ?`SELECT a.*,e.title,u.name FROM attempts a JOIN exams e ON e.id=a.exam_id JOIN users u ON u.id=a.user_id WHERE a.submitted_at IS NOT NULL ORDER BY a.submitted_at DESC`
+    :`SELECT a.*,e.title,u.name FROM attempts a JOIN exams e ON e.id=a.exam_id JOIN users u ON u.id=a.user_id WHERE a.user_id=? AND a.submitted_at IS NOT NULL ORDER BY a.submitted_at DESC`;
+  const [r]=await db.query(sql,[req.user.id]);
+  res.json(r);
+}));
 
-  const q=data.questions[idx],m=String(Math.floor(time/60)).padStart(2,'0'),s=String(time%60).padStart(2,'0');
-  return <div className="wrap nosel"><div className="card">
-    <div className="top"><b>{data.title}</b><span className={'timer '+(time<60?'warn':'')}>{m}:{s}</span></div>
-    <small>Violations: {viol}/{MAX_VIOLATIONS}</small>{msg&&<p className="warn">{msg}</p>}</div>
-    <div className="card"><p><b>Q{idx+1}/{data.questions.length}.</b> {q.text}</p>
-      {['a','b','c','d'].map(o=><label key={o} className={'opt '+(answers[q.id]===o?'sel':'')}>
-        <input type="radio" style={{width:'auto',marginRight:8}} checked={answers[q.id]===o} onChange={()=>setAnswers({...answers,[q.id]:o})}/>{q[o]}</label>)}
-      <button className="sec" disabled={idx===0} onClick={()=>setIdx(idx-1)}>Prev</button>
-      <button disabled={idx===data.questions.length-1} onClick={()=>setIdx(idx+1)}>Next</button>
-      <button className="red" onClick={()=>window.confirm('Submit exam?')&&submit()}>Submit</button>
-    </div></div>;
-}
+// Admin: create exam with questions
+app.post('/api/exams',auth,adminOnly,wrap(async(req,res)=>{
+  const{title,duration_min,questions}=req.body;
+  if(!title||!duration_min||!Array.isArray(questions)||!questions.length)return res.status(400).json({error:'Invalid data'});
+  const [i]=await db.query('INSERT INTO exams(title,duration_min) VALUES(?,?)',[title,duration_min]);
+  for(const q of questions)
+    await db.query('INSERT INTO questions(exam_id,text,a,b,c,d,correct) VALUES(?,?,?,?,?,?,?)',[i.insertId,q.text,q.a,q.b,q.c,q.d,q.correct]);
+  res.json({ok:true,id:i.insertId});
+}));
 
-function Admin({onBack}){
-  const [title,setTitle]=useState(''),[dur,setDur]=useState(10),[msg,setMsg]=useState('');
-  const blank={text:'',a:'',b:'',c:'',d:'',correct:'a'};
-  const [qs,setQs]=useState([{...blank}]);
-  const upd=(i,k,v)=>setQs(qs.map((q,j)=>j===i?{...q,[k]:v}:q));
-  const save=async()=>{try{await api('/exams','POST',{title,duration_min:+dur,questions:qs});setMsg('Exam created!');}catch(e){setMsg(e.message);}};
-  return <div className="wrap"><div className="card"><h3>Create Exam</h3>
-    <input placeholder="Title" onChange={e=>setTitle(e.target.value)}/>
-    <input type="number" placeholder="Duration (minutes)" value={dur} onChange={e=>setDur(e.target.value)}/></div>
-    {qs.map((q,i)=><div className="card" key={i}><b>Question {i+1}</b>
-      <textarea placeholder="Question" onChange={e=>upd(i,'text',e.target.value)}/>
-      {['a','b','c','d'].map(o=><input key={o} placeholder={'Option '+o.toUpperCase()} onChange={e=>upd(i,o,e.target.value)}/>)}
-      <select value={q.correct} onChange={e=>upd(i,'correct',e.target.value)}>{['a','b','c','d'].map(o=><option key={o} value={o}>Correct: {o.toUpperCase()}</option>)}</select></div>)}
-    <button className="sec" onClick={()=>setQs([...qs,{...blank}])}>+ Add Question</button>
-    <button onClick={save}>Save Exam</button><button className="sec" onClick={onBack}>Back</button><p>{msg}</p></div>;
-}
-
-function Dashboard({user,onLogout,onStart}){
-  const [exams,setExams]=useState([]),[results,setResults]=useState([]),[admin,setAdmin]=useState(false);
-  useEffect(()=>{api('/exams').then(setExams);api('/results').then(setResults);},[admin]);
-  if(admin)return <Admin onBack={()=>setAdmin(false)}/>;
-  return <div className="wrap"><div className="card top"><b>Hi, {user.name} ({user.role})</b><button className="sec" onClick={onLogout}>Logout</button></div>
-    {user.role==='admin'&&<button onClick={()=>setAdmin(true)}>+ Create Exam</button>}
-    <h3>Exams</h3>{exams.map(e=><div className="card top" key={e.id}><div><b>{e.title}</b><br/><small>{e.qcount} questions, {e.duration_min} min</small></div>
-      {user.role==='student'&&(e.done?<span>Done</span>:<button onClick={()=>onStart(e.id)}>Start</button>)}</div>)}
-    <h3>Results</h3><div className="card"><table><thead><tr><th>Exam</th>{user.role==='admin'&&<th>Student</th>}<th>Score</th><th>Violations</th></tr></thead>
-      <tbody>{results.map(r=><tr key={r.id}><td>{r.title}</td>{user.role==='admin'&&<td>{r.name}</td>}<td>{r.score}/{r.total}</td><td>{r.violations}</td></tr>)}</tbody></table></div></div>;
-}
-
-export default function App(){
-  const [user,setUser]=useState(()=>JSON.parse(localStorage.getItem('user')||'null')),[exam,setExam]=useState(null);
-  const logout=()=>{localStorage.clear();setUser(null);};
-  if(!user)return <Auth onLogin={setUser}/>;
-  if(exam)return <Exam examId={exam} onExit={()=>setExam(null)}/>;
-  return <Dashboard user={user} onLogout={logout} onStart={setExam}/>;
-}
+app.listen(process.env.PORT||5000,()=>console.log('Server running'));
