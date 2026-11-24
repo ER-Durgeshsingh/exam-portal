@@ -10,3 +10,5 @@ button.sec{background:#6b7280}button.red{background:#dc2626}
 .timer{font-weight:700;font-size:20px}.warn{color:#dc2626}
 table{width:100%;border-collapse:collapse}td,th{padding:8px;border-bottom:1px solid #eee;text-align:left;font-size:14px}
 .nosel{user-select:none;-webkit-user-select:none}
+.card form{margin:0}.warn{color:#dc2626}.opt:hover{background:#f3f4f6}small{color:#6b7280}.warn small{color:inherit}
+button:disabled{opacity:.5;cursor:not-allowed}
